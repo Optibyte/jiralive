@@ -528,6 +528,10 @@ def health():
 
 
 
+# -- Auto-load Jira credentials from CTO DB on startup --
+# This ensures it runs even when imported by Gunicorn on Render
+load_jira_config_from_cto_db()
+
 
 if __name__ == "__main__":
     print("\n" + "="*55)
@@ -538,8 +542,7 @@ if __name__ == "__main__":
     print(f"[@] Public URL      : (Check your ngrok terminal)")
     print("="*55 + "\n")
 
-    # -- Auto-load Jira credentials from CTO DB on startup --
-    load_jira_config_from_cto_db()
+    # Config already loaded at module level for Render
 
     # -- Automatically start ngrok --
     print("[*] Attempting to start ngrok tunnel on port 5000...")
