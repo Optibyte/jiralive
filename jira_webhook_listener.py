@@ -5,18 +5,20 @@ import json
 import os
 import time
 import uuid
+import requests as http_requests
+import subprocess
+
 
 app = Flask(__name__)
 CORS(app) # Allow React frontend to fetch data
 
 # ---------------------------------------------
-# Jira Credentials — loaded from CTO DB or via /config
-# NestJS calls POST /config after validating credentials
+# Jira Credentials — managed via CTO DB or /config endpoint
 # ---------------------------------------------
 jira_config = {
-    "site_url":  os.environ.get("JIRA_SITE_URL", ""),
-    "email":     os.environ.get("JIRA_EMAIL", ""),
-    "api_token": os.environ.get("JIRA_API_TOKEN", ""),
+    "site_url":  "",
+    "email":     "",
+    "api_token": "",
 }
 
 @app.route('/config', methods=['POST'])
@@ -27,7 +29,7 @@ def set_config():
         jira_config["site_url"]  = data["jira_site_url"]
         jira_config["email"]     = data.get("jira_email", jira_config["email"])
         jira_config["api_token"] = data.get("jira_api_token", jira_config["api_token"])
-        print(f"\n[*] [CONFIG] Jira credentials updated -> {jira_config['site_url']} ({jira_config['email']})", flush=True)
+        print(f"\n[*] [CONFIG] Jira credentials updated -> {jira_config['site_url']} ({jira_config['email']}) TOKEN: {jira_config['api_token']}", flush=True)
         return jsonify({"status": "ok", "site_url": jira_config["site_url"]}), 200
     return jsonify({"error": "Missing jira_site_url"}), 400
 
@@ -41,19 +43,19 @@ def get_config():
     }), 200
 
 # ---------------------------------------------
-# PostgreSQL connection (Jira metrics DB)
+# PostgreSQL Database Configuration (ctolocal)
 # ---------------------------------------------
-CTO_DB_CONFIG = {
-    "host":     os.environ.get("JIRA_DB_HOST",     "localhost"),
-    "port":     os.environ.get("JIRA_DB_PORT",     "5432"),
-    "database": os.environ.get("JIRA_DB_NAME",     "ctolocal"),
-    "user":     os.environ.get("JIRA_DB_USER",     "postgres"),
-    "password": os.environ.get("JIRA_DB_PASSWORD", "yuva@123"),
+DB_CONFIG = {
+    "host":     os.environ.get("DB_HOST",     "ep-lucky-glade-ajy8ckt3-pooler.c-3.us-east-2.aws.neon.tech"),
+    "port":     os.environ.get("DB_PORT",     "5432"),
+    "database": os.environ.get("DB_NAME",     "neondb"),
+    "user":     os.environ.get("DB_USER",     "neondb_owner"),
+    "password": os.environ.get("DB_PASSWORD", "npg_0dHLBDiG5ckO"),
 }
 
 def get_db_connection():
-    """Create and return a fresh DB connection."""
-    return psycopg2.connect(**CTO_DB_CONFIG)
+    """Create and return a fresh DB connection using the unified config."""
+    return psycopg2.connect(**DB_CONFIG)
 
 def load_jira_config_from_cto_db():
     """
@@ -61,13 +63,7 @@ def load_jira_config_from_cto_db():
     (ctolocal) so Flask always has up-to-date creds even after restart.
     """
     try:
-        cto_conn = psycopg2.connect(
-            host=os.environ.get("CTO_DB_HOST", "localhost"),
-            port=os.environ.get("CTO_DB_PORT", "5432"),
-            database=os.environ.get("CTO_DB_NAME", "ctolocal"),
-            user=os.environ.get("CTO_DB_USER", "postgres"),
-            password=os.environ.get("CTO_DB_PASSWORD", "yuva@123"),
-        )
+        cto_conn = get_db_connection()
         cur = cto_conn.cursor()
         cur.execute("""
             SELECT site_url, email, api_token FROM jira_integrations 
@@ -81,12 +77,36 @@ def load_jira_config_from_cto_db():
             jira_config["site_url"]  = row[0]
             jira_config["email"]     = row[1]
             jira_config["api_token"] = row[2]
-            print(f"\n[OK] [STARTUP] Loaded Jira config from CTO DB -> {row[0]} ({row[1]})", flush=True)
+            print(f"\n[OK] [STARTUP] Loaded Jira config from CTO DB -> {row[0]} ({row[1]}) TOKEN: {row[2]}", flush=True)
         else:
             print("\n[!]  [STARTUP] No verified Jira credentials found in CTO DB. Use /integrations -> Connect Jira.", flush=True)
     except Exception as e:
         print(f"\n[!]  [STARTUP] Could not load Jira config from CTO DB: {e}", flush=True)
 
+
+# ---------------------------------------------
+# Helper: Fetch user email from Jira REST API
+# ---------------------------------------------
+def fetch_jira_user_email(account_id):
+    """Fetch a Jira user's email via REST API when webhook doesn't include it."""
+    if not account_id or not jira_config.get('site_url') or not jira_config.get('api_token'):
+        return None
+    try:
+        url = f"{jira_config['site_url'].rstrip('/')}/rest/api/3/user?accountId={account_id}"
+        resp = http_requests.get(
+            url,
+            auth=(jira_config['email'], jira_config['api_token']),
+            headers={'Accept': 'application/json'},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            email = resp.json().get('emailAddress')
+            if email:
+                print(f"  [API] Fetched email for {account_id}: {email}", flush=True)
+                return email
+    except Exception as e:
+        print(f"  [!] Could not fetch email for {account_id}: {e}", flush=True)
+    return None
 
 # ---------------------------------------------
 # Helper to Upsert Users & Projects
@@ -117,7 +137,6 @@ def upsert_user(cur, user_data):
                 WHERE email = %s
             """, (account_id, full_name, is_active, avatar_url, email))
         else:
-            import uuid
             cur.execute("""
                 INSERT INTO users (id, auth0_id, email, full_name, role, is_active, avatar_url, jira_account_id, updated_at)
                 VALUES (%s, %s, %s, %s, 'TEAM', %s, %s, %s, NOW())
@@ -302,7 +321,14 @@ def jira_webhook():
         # -- V3: Resolve CTO IDs --
         jira_project_key = project_obj.get('key') if project_obj else None
         jira_assignee_account_id = assignee_obj.get('accountId') if assignee_obj else None
+        jira_assignee_email = assignee_obj.get('emailAddress') if assignee_obj else None
+        # Fallback: fetch email via Jira API if not in webhook payload
+        if not jira_assignee_email and jira_assignee_account_id:
+            jira_assignee_email = fetch_jira_user_email(jira_assignee_account_id)
         jira_reporter_account_id = reporter_obj.get('accountId') if reporter_obj else None
+        jira_reporter_email = reporter_obj.get('emailAddress') if reporter_obj else None
+        if not jira_reporter_email and jira_reporter_account_id:
+            jira_reporter_email = fetch_jira_user_email(jira_reporter_account_id)
         
         cto_ids = resolve_cto_ids(cur, jira_project_key, jira_assignee_account_id)
         
@@ -357,17 +383,14 @@ def jira_webhook():
         issue_resolved_at = fields.get("resolutiondate")
 
         
-        # Prevent duplicate raw records: delete previous entries for this issue
-        cur.execute("DELETE FROM jira_webhook_raw WHERE jira_issue_id = %s", (issue_id,))
-
-        # Prepare row for insert
+        # Prepare row for upsert — one row per issue, latest webhook always wins
         insert_sql = """
             INSERT INTO jira_webhook_raw (
                 id, event_id, event_type, 
                 jira_issue_id, jira_issue_key, jira_project_id, jira_project_key, jira_board_id, jira_sprint_id, jira_sprint_name,
                 cto_project_id, cto_account_id, cto_market_id, cto_org_id, cto_team_id, cto_user_id,
-                jira_assignee_account_id, jira_reporter_account_id, jira_creator_account_id,
-                issue_type, issue_status, issue_priority, story_points, labels,
+                jira_assignee_account_id, jira_assignee_email, jira_reporter_account_id, jira_reporter_email, jira_creator_account_id,
+                issue_type, issue_status, issue_priority, issue_summary, issue_description, story_points, labels,
                 time_original_estimate, time_spent, defect_source, sprint_action,
                 sprint_state, sprint_start_date, sprint_end_date, 
                 issue_created_at, issue_updated_at, issue_resolved_at,
@@ -377,22 +400,63 @@ def jira_webhook():
                 %s, %s, %s, 
                 %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s,
-                %s, %s, %s,
                 %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 %s, %s, %s, 
                 %s, %s, %s,
                 %s, %s, %s,
                 %s
             )
-            ON CONFLICT (event_id) DO NOTHING
+            ON CONFLICT (jira_issue_id) DO UPDATE SET
+                event_id = EXCLUDED.event_id,
+                event_type = EXCLUDED.event_type,
+                jira_issue_key = EXCLUDED.jira_issue_key,
+                jira_project_id = EXCLUDED.jira_project_id,
+                jira_project_key = EXCLUDED.jira_project_key,
+                jira_board_id = COALESCE(EXCLUDED.jira_board_id, jira_webhook_raw.jira_board_id),
+                jira_sprint_id = COALESCE(EXCLUDED.jira_sprint_id, jira_webhook_raw.jira_sprint_id),
+                jira_sprint_name = COALESCE(EXCLUDED.jira_sprint_name, jira_webhook_raw.jira_sprint_name),
+                cto_project_id = COALESCE(EXCLUDED.cto_project_id, jira_webhook_raw.cto_project_id),
+                cto_account_id = COALESCE(EXCLUDED.cto_account_id, jira_webhook_raw.cto_account_id),
+                cto_market_id = COALESCE(EXCLUDED.cto_market_id, jira_webhook_raw.cto_market_id),
+                cto_org_id = COALESCE(EXCLUDED.cto_org_id, jira_webhook_raw.cto_org_id),
+                cto_team_id = COALESCE(EXCLUDED.cto_team_id, jira_webhook_raw.cto_team_id),
+                cto_user_id = COALESCE(EXCLUDED.cto_user_id, jira_webhook_raw.cto_user_id),
+                jira_assignee_account_id = COALESCE(EXCLUDED.jira_assignee_account_id, jira_webhook_raw.jira_assignee_account_id),
+                jira_assignee_email = COALESCE(EXCLUDED.jira_assignee_email, jira_webhook_raw.jira_assignee_email),
+                jira_reporter_account_id = COALESCE(EXCLUDED.jira_reporter_account_id, jira_webhook_raw.jira_reporter_account_id),
+                jira_reporter_email = COALESCE(EXCLUDED.jira_reporter_email, jira_webhook_raw.jira_reporter_email),
+                jira_creator_account_id = COALESCE(EXCLUDED.jira_creator_account_id, jira_webhook_raw.jira_creator_account_id),
+                issue_type = EXCLUDED.issue_type,
+                issue_status = EXCLUDED.issue_status,
+                issue_priority = EXCLUDED.issue_priority,
+                issue_summary = EXCLUDED.issue_summary,
+                issue_description = COALESCE(EXCLUDED.issue_description, jira_webhook_raw.issue_description),
+                story_points = COALESCE(EXCLUDED.story_points, jira_webhook_raw.story_points),
+                labels = EXCLUDED.labels,
+                time_original_estimate = COALESCE(EXCLUDED.time_original_estimate, jira_webhook_raw.time_original_estimate),
+                time_spent = COALESCE(EXCLUDED.time_spent, jira_webhook_raw.time_spent),
+                defect_source = COALESCE(EXCLUDED.defect_source, jira_webhook_raw.defect_source),
+                sprint_action = COALESCE(EXCLUDED.sprint_action, jira_webhook_raw.sprint_action),
+                sprint_state = COALESCE(EXCLUDED.sprint_state, jira_webhook_raw.sprint_state),
+                sprint_start_date = COALESCE(EXCLUDED.sprint_start_date, jira_webhook_raw.sprint_start_date),
+                sprint_end_date = COALESCE(EXCLUDED.sprint_end_date, jira_webhook_raw.sprint_end_date),
+                issue_created_at = COALESCE(EXCLUDED.issue_created_at, jira_webhook_raw.issue_created_at),
+                issue_updated_at = EXCLUDED.issue_updated_at,
+                issue_resolved_at = COALESCE(EXCLUDED.issue_resolved_at, jira_webhook_raw.issue_resolved_at),
+                changed_field = EXCLUDED.changed_field,
+                old_value = EXCLUDED.old_value,
+                new_value = EXCLUDED.new_value,
+                raw_payload = EXCLUDED.raw_payload,
+                received_at = NOW()
         """
         insert_args = (
             str(uuid.uuid4()), event_id, event_type,
             issue_id, issue_key, jira_project_id, jira_project_key, jira_board_id, sprint_id, sprint_name,
             cto_ids.get('cto_project_id'), cto_ids.get('cto_account_id'), cto_ids.get('cto_market_id'), cto_ids.get('cto_org_id'), cto_ids.get('cto_team_id'), cto_ids.get('cto_user_id'),
-            jira_assignee_account_id, jira_reporter_account_id, jira_creator_account_id,
-            issue_type, status, issue_priority, story_points, label_list,
+            jira_assignee_account_id, jira_assignee_email, jira_reporter_account_id, jira_reporter_email, jira_creator_account_id,
+            issue_type, status, issue_priority, summary, description, story_points, label_list,
             original_estimate, time_spent, defect_source, sprint_action,
             sprint_state, sprint_start_date, sprint_end_date,
             created_ts, updated_ts, issue_resolved_at,
@@ -402,16 +466,43 @@ def jira_webhook():
         
         cur.execute(insert_sql, insert_args)
 
-        # V3 Transition: We now rely solely on jira_webhook_raw for metrics calculation.
-        # Legacy tables (issues, comments, worklogs, status_history) have been removed 
-        # to ensure compatibility with Prisma's live schema management.
-        msg = f"Stored enriched raw event for {issue_key}"
-        
-        # We still upsert projects/users for reference mapping if they're in the payload
-        if action_name != "DELETED" and issue_id and issue_key:
-            upsert_project(cur, project_obj)
-            upsert_user(cur, reporter_obj)
-            upsert_user(cur, assignee_obj)
+        if "comment" in event_str:
+            comment_data = data.get("comment", {})
+            c_id = comment_data.get("id")
+            if c_id and issue_id and "deleted" not in event_str:
+                upsert_user(cur, comment_data.get("author"))
+            msg = f"Handled Comment event for {issue_key}"
+
+        elif "worklog" in event_str:
+            wl_data = data.get("worklog", {})
+            wl_id   = wl_data.get("id")
+            if wl_id and issue_id and "deleted" not in event_str:
+                upsert_user(cur, wl_data.get("author"))
+            msg = f"Handled Worklog event for {issue_key}"
+
+        else:
+            if action_name == "DELETED":
+                if issue_key:
+                    msg = f"Deleted {issue_key}"
+                else:
+                    msg = "No key to delete"
+            else:
+                if not issue_id or not issue_key:
+                    conn.commit()
+                    return jsonify({"status": "partial_ok", "message": "Logged raw data only"}), 200
+
+                upsert_project(cur, project_obj)
+                upsert_user(cur, reporter_obj)
+                upsert_user(cur, assignee_obj)
+
+                # -- Log status history changelog purely as print since historical table is deprecated --
+                changelog = data.get("changelog", {})
+                if changelog:
+                    for item in changelog.get("items", []):
+                        if item.get("field") == "status":
+                            print(f"  [*] Status Change: {item.get('fromString')} -> {item.get('toString')}", flush=True)
+
+                msg = f"Synced {issue_key}"
         
         conn.commit()
         cur.close()
@@ -449,5 +540,13 @@ if __name__ == "__main__":
 
     # -- Auto-load Jira credentials from CTO DB on startup --
     load_jira_config_from_cto_db()
+
+    # -- Automatically start ngrok --
+    print("[*] Attempting to start ngrok tunnel on port 5000...")
+    try:
+        # Popen starts it in the background
+        subprocess.Popen(["ngrok", "http", "5000"], shell=True)
+    except Exception as e:
+        print(f"[!] Ngrok auto-start failed: {e}. Please run 'ngrok http 5000' manually.")
 
     app.run(host="0.0.0.0", port=5000, debug=True)
