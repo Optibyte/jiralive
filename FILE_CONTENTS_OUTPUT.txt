@@ -1,0 +1,714 @@
+================================================================================
+FILE: apply_db.py (COMPLETE)
+================================================================================
+  1: import psycopg2
+  2: import sys
+  3: 
+  4: def apply_sql():
+  5:     try:
+  6:         conn = psycopg2.connect(
+  7:             host="localhost",
+  8:             port="5432",
+  9:             database="jira_dashboard",
+ 10:             user="postgres",
+ 11:             password="yuva@123"
+ 12:         )
+ 13:         conn.autocommit = True
+ 14:         cur = conn.cursor()
+ 15:         
+ 16:         print("Reading db_setup.sql...")
+ 17:         with open(r'd:\jira_live\db_setup.sql', 'r') as f:
+ 18:             sql = f.read()
+ 19:         
+ 20:         print("Applying SQL schema...")
+ 21:         cur.execute(sql)
+ 22:         print("✅ Database schema updated successfully!")
+ 23:         
+ 24:         # Add a dummy project to prevent initial "no project" errors
+ 25:         cur.execute("""
+ 26:             INSERT INTO projects (id, key, name, project_type) 
+ 27:             VALUES ('10000', 'PROJ', 'Sample Project', 'software')
+ 28:             ON CONFLICT (id) DO NOTHING;
+ 29:         """)
+ 30:         
+ 31:         cur.close()
+ 32:         conn.close()
+ 33:     except Exception as e:
+ 34:         print(f"❌ Error applying SQL: {e}")
+ 35:         sys.exit(1)
+ 36: 
+ 37: if __name__ == "__main__":
+ 38:     apply_sql()
+ 39: 
+
+
+================================================================================
+FILE: jira_webhook_listener.py (COMPLETE)
+================================================================================
+   1: from flask import Flask, request, jsonify
+   2: from flask_cors import CORS
+   3: import psycopg2
+   4: import json
+   5: import os
+   6: 
+   7: app = Flask(__name__)
+   8: CORS(app) # Allow React frontend to fetch data
+   9: 
+  10: # ─────────────────────────────────────────────
+  11: # Jira Credentials — loaded from CTO DB or via /config
+  12: # NestJS calls POST /config after validating credentials
+  13: # ─────────────────────────────────────────────
+  14: jira_config = {
+  15:     "site_url":  os.environ.get("JIRA_SITE_URL", ""),
+  16:     "email":     os.environ.get("JIRA_EMAIL", ""),
+  17:     "api_token": os.environ.get("JIRA_API_TOKEN", ""),
+  18: }
+  19: 
+  20: @app.route('/config', methods=['POST'])
+  21: def set_config():
+  22:     """NestJS calls this after credential validation to push config into Flask."""
+  23:     data = request.get_json(silent=True) or {}
+  24:     if data.get("jira_site_url"):
+  25:         jira_config["site_url"]  = data["jira_site_url"]
+  26:         jira_config["email"]     = data.get("jira_email", jira_config["email"])
+  27:         jira_config["api_token"] = data.get("jira_api_token", jira_config["api_token"])
+  28:         print(f"\n🔑 [CONFIG] Jira credentials updated → {jira_config['site_url']} ({jira_config['email']})", flush=True)
+  29:         return jsonify({"status": "ok", "site_url": jira_config["site_url"]}), 200
+  30:     return jsonify({"error": "Missing jira_site_url"}), 400
+  31: 
+  32: @app.route('/config', methods=['GET'])
+  33: def get_config():
+  34:     """Return current config (without the API token for security)."""
+  35:     return jsonify({
+  36:         "site_url":   jira_config["site_url"],
+  37:         "email":      jira_config["email"],
+  38:         "configured": bool(jira_config["site_url"] and jira_config["api_token"]),
+  39:     }), 200
+  40: 
+  41: # ─────────────────────────────────────────────
+  42: # PostgreSQL connection (Jira metrics DB)
+  43: # ─────────────────────────────────────────────
+  44: CTO_DB_CONFIG = {
+  45:     "host":     os.environ.get("JIRA_DB_HOST",     "localhost"),
+  46:     "port":     os.environ.get("JIRA_DB_PORT",     "5432"),
+  47:     "database": os.environ.get("JIRA_DB_NAME",     "jira_dashboard"),
+  48:     "user":     os.environ.get("JIRA_DB_USER",     "postgres"),
+  49:     "password": os.environ.get("JIRA_DB_PASSWORD", "yuva@123"),
+  50: }
+  51: 
+  52: def get_db_connection():
+  53:     """Create and return a fresh DB connection."""
+  54:     return psycopg2.connect(**CTO_DB_CONFIG)
+  55: 
+  56: def load_jira_config_from_cto_db():
+  57:     """
+  58:     On startup: try to read Jira credentials from the CTO platform DB 
+  59:     (ctolocal) so Flask always has up-to-date creds even after restart.
+  60:     """
+  61:     try:
+  62:         cto_conn = psycopg2.connect(
+  63:             host=os.environ.get("CTO_DB_HOST", "localhost"),
+  64:             port=os.environ.get("CTO_DB_PORT", "5432"),
+  65:             database=os.environ.get("CTO_DB_NAME", "ctolocal"),
+  66:             user=os.environ.get("CTO_DB_USER", "postgres"),
+  67:             password=os.environ.get("CTO_DB_PASSWORD", "yuva@123"),
+  68:         )
+  69:         cur = cto_conn.cursor()
+  70:         cur.execute("""
+  71:             SELECT site_url, email, api_token FROM jira_integrations 
+  72:             WHERE is_verified = TRUE AND is_active = TRUE 
+  73:             ORDER BY updated_at DESC LIMIT 1
+  74:         """)
+  75:         row = cur.fetchone()
+  76:         cur.close()
+  77:         cto_conn.close()
+  78:         if row:
+  79:             jira_config["site_url"]  = row[0]
+  80:             jira_config["email"]     = row[1]
+  81:             jira_config["api_token"] = row[2]
+  82:             print(f"\n✅ [STARTUP] Loaded Jira config from CTO DB → {row[0]} ({row[1]})", flush=True)
+  83:         else:
+  84:             print("\n⚠️  [STARTUP] No verified Jira credentials found in CTO DB. Use /integrations → Connect Jira.", flush=True)
+  85:     except Exception as e:
+  86:         print(f"\n⚠️  [STARTUP] Could not load Jira config from CTO DB: {e}", flush=True)
+  87: 
+  88: 
+  89: # ─────────────────────────────────────────────
+  90: # Helper to Upsert Users & Projects
+  91: # ─────────────────────────────────────────────
+  92: def upsert_user(cur, user_data):
+  93:     if not user_data or not isinstance(user_data, dict): return None
+  94:     account_id = user_data.get("accountId")
+  95:     if not account_id: return None
+  96:     
+  97:     cur.execute("""
+  98:         INSERT INTO users (account_id, display_name, email, active, avatar_url)
+  99:         VALUES (%s, %s, %s, %s, %s)
+ 100:         ON CONFLICT (account_id) DO UPDATE SET
+ 101:             display_name = EXCLUDED.display_name,
+ 102:             email = EXCLUDED.email,
+ 103:             active = EXCLUDED.active,
+ 104:             avatar_url = EXCLUDED.avatar_url;
+ 105:     """, (account_id, user_data.get("displayName"), user_data.get("emailAddress"), user_data.get("active", True), user_data.get("avatarUrls", {}).get("48x48")))
+ 106:     return account_id
+ 107: 
+ 108: def upsert_project(cur, project_data):
+ 109:     if not project_data or not isinstance(project_data, dict): return None
+ 110:     proj_id = project_data.get("id")
+ 111:     if not proj_id: return None
+ 112:     
+ 113:     cur.execute("""
+ 114:         INSERT INTO projects (id, key, name, project_type)
+ 115:         VALUES (%s, %s, %s, %s)
+ 116:         ON CONFLICT (id) DO UPDATE SET
+ 117:             key = EXCLUDED.key,
+ 118:             name = EXCLUDED.name,
+ 119:             project_type = EXCLUDED.project_type;
+ 120:     """, (proj_id, project_data.get("key"), project_data.get("name"), project_data.get("projectTypeKey")))
+ 121:     return proj_id
+ 122: 
+ 123: # ─────────────────────────────────────────────
+ 124: # Build WHERE clause from request filters
+ 125: # Supports: ?project=BANK,ALGO  ?assignee=acc-01,acc-02
+ 126: # ─────────────────────────────────────────────
+ 127: def build_filters():
+ 128:     """Parse URL params into SQL WHERE snippets and argument lists."""
+ 129:     project_param = request.args.get('project', '')   # "BANK" or "BANK,ALGO"
+ 130:     assignee_param = request.args.get('assignee', '') # "acc-01" or "acc-01,acc-02"
+ 131: 
+ 132:     project_keys = [p.strip().upper() for p in project_param.split(',') if p.strip()]
+ 133:     assignee_ids = [a.strip() for a in assignee_param.split(',') if a.strip()]
+ 134: 
+ 135:     where_parts = []
+ 136:     args = []
+ 137: 
+ 138:     if project_keys:
+ 139:         placeholders = ','.join(['%s'] * len(project_keys))
+ 140:         where_parts.append(f"""
+ 141:             project_id IN (
+ 142:                 SELECT id FROM projects WHERE UPPER(key) IN ({placeholders})
+ 143:             )
+ 144:         """)
+ 145:         args.extend(project_keys)
+ 146: 
+ 147:     if assignee_ids:
+ 148:         ph = ','.join(['%s'] * len(assignee_ids))
+ 149:         where_parts.append(f"assignee IN ({ph})")
+ 150:         args.extend(assignee_ids)
+ 151: 
+ 152:     where_sql = "AND " + " AND ".join(where_parts) if where_parts else ""
+ 153:     return where_sql, args
+ 154: 
+ 155: # ─────────────────────────────────────────────
+ 156: # Jira Webhook Endpoint
+ 157: # ─────────────────────────────────────────────
+ 158: @app.route('/jira/webhook', methods=['POST'])
+ 159: def jira_webhook():
+ 160:     # ── 1. Check Payload ────────────────────────
+ 161:     data = request.get_json(silent=True, force=True)
+ 162:     
+ 163:     if data is None:
+ 164:         raw_body = request.get_data(as_text=True)
+ 165:         
+ 166:         if not raw_body:
+ 167:             content_len = request.headers.get('Content-Length', '0')
+ 168:             print(f"\n🔍 [DEBUG] Empty Body Received")
+ 169:             print(f"   Method: {request.method}")
+ 170:             print(f"   URL   : {request.url}")
+ 171: 
+ 172:             if request.args:
+ 173:                 data = request.args.to_dict()
+ 174:             else:
+ 175:                 if content_len == '0':
+ 176:                     print("   💓 [INFO] Heartbeat/Probe (No Content)")
+ 177:                 return jsonify({"status": "heartbeat", "message": "Listening..."}), 200
+ 178:         else:
+ 179:             try:
+ 180:                 data = json.loads(raw_body)
+ 181:             except Exception as e:
+ 182:                 print(f"\n⚠️  [WARN] Received Non-JSON Payload. Error: {e}")
+ 183:                 return jsonify({"message": "Expected JSON", "error": str(e)}), 400
+ 184: 
+ 185:     # ── 2. Identify Event Type ────────────────
+ 186:     event_type = data.get("webhookEvent") or data.get("issue_event_type_name") or data.get("event")
+ 187:     triggered_by = data.get("triggeredByUser")
+ 188:     
+ 189:     if not event_type:
+ 190:         if triggered_by:
+ 191:             return jsonify({"status": "meta_received", "triggered_by": triggered_by}), 200
+ 192:         if "test" in str(data).lower():
+ 193:             return jsonify({"message": "Test successful"}), 200
+ 194:         return jsonify({"message": "Payload received but no event type identified"}), 200
+ 195: 
+ 196:     # ── 3. Extract Details ──────────────────────
+ 197:     issue_data   = data.get("issue", {})
+ 198:     fields       = issue_data.get("fields", {})
+ 199:     issue_id     = issue_data.get("id")
+ 200:     issue_key    = issue_data.get("key") or data.get("issue_key")
+ 201:     
+ 202:     summary      = fields.get("summary", "No Summary")
+ 203:     description  = fields.get("description")
+ 204:     if isinstance(description, dict): 
+ 205:         description = json.dumps(description)
+ 206:     
+ 207:     issue_type   = fields.get("issuetype", {}).get("name")
+ 208:     status       = fields.get("status", {}).get("name")
+ 209:     priority     = fields.get("priority", {}).get("name")
+ 210:     created_ts   = fields.get("created")
+ 211:     updated_ts   = fields.get("updated")
+ 212:     due_date     = fields.get("duedate")
+ 213:     story_points = fields.get("customfield_10016") or fields.get("customfield_10002")
+ 214:     if story_points and not isinstance(story_points, (int, float)):
+ 215:         story_points = None
+ 216:     
+ 217:     reporter_obj = fields.get("reporter")
+ 218:     assignee_obj = fields.get("assignee")
+ 219:     project_obj  = fields.get("project")
+ 220: 
+ 221:     # ── 4. Log to Terminal ────────
+ 222:     color_code = "\033[94m"
+ 223:     event_str  = str(event_type).lower()
+ 224:     if "created" in event_str:   color_code = "\033[92m"; action_name = "CREATED"
+ 225:     elif "deleted" in event_str: color_code = "\033[91m"; action_name = "DELETED"
+ 226:     elif "updated" in event_str: color_code = "\033[94m"; action_name = "UPDATED"
+ 227:     else:                        action_name = event_type.upper()
+ 228:     reset_code = "\033[0m"
+ 229: 
+ 230:     print(f"\n{color_code}──────────────────────────────────────────────────{reset_code}", flush=True)
+ 231:     print(f"{color_code}🔔 JIRA ACTIVITY: {action_name}{reset_code}", flush=True)
+ 232:     if issue_key:
+ 233:         print(f"   Issue    : {issue_key}", flush=True)
+ 234:         print(f"   Summary  : {summary}", flush=True)
+ 235:         print(f"   Status   : \033[1m{status}\033[0m", flush=True)
+ 236:     print(f"{color_code}──────────────────────────────────────────────────{reset_code}", flush=True)
+ 237: 
+ 238:     # ── 5. Database Interaction ──
+ 239:     try:
+ 240:         conn = get_db_connection()
+ 241:         cur  = conn.cursor()
+ 242:         
+ 243:         cur.execute("""
+ 244:             INSERT INTO jira_webhook_raw (event_type, issue_key, payload)
+ 245:             VALUES (%s, %s, %s)
+ 246:         """, (event_type, issue_key, json.dumps(data)))
+ 247: 
+ 248:         if "comment" in event_str:
+ 249:             comment_data = data.get("comment", {})
+ 250:             c_id = comment_data.get("id")
+ 251:             if c_id and issue_id:
+ 252:                 if "deleted" in event_str:
+ 253:                     cur.execute("DELETE FROM comments WHERE id = %s", (c_id,))
+ 254:                 else:
+ 255:                     author_id = upsert_user(cur, comment_data.get("author"))
+ 256:                     cur.execute("""
+ 257:                         INSERT INTO comments (id, issue_id, author_account_id, body, created, updated)
+ 258:                         VALUES (%s, %s, %s, %s, %s, %s)
+ 259:                         ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, updated = EXCLUDED.updated;
+ 260:                     """, (c_id, issue_id, author_id, comment_data.get("body"), comment_data.get("created"), comment_data.get("updated")))
+ 261:             msg = f"Handled Comment event for {issue_key}"
+ 262: 
+ 263:         elif "worklog" in event_str:
+ 264:             wl_data = data.get("worklog", {})
+ 265:             wl_id   = wl_data.get("id")
+ 266:             if wl_id and issue_id:
+ 267:                 if "deleted" in event_str:
+ 268:                     cur.execute("DELETE FROM worklogs WHERE id = %s", (wl_id,))
+ 269:                 else:
+ 270:                     author_id = upsert_user(cur, wl_data.get("author"))
+ 271:                     cur.execute("""
+ 272:                         INSERT INTO worklogs (id, issue_id, author_account_id, time_spent_seconds, started, created)
+ 273:                         VALUES (%s, %s, %s, %s, %s, %s)
+ 274:                         ON CONFLICT (id) DO UPDATE SET time_spent_seconds = EXCLUDED.time_spent_seconds, started = EXCLUDED.started;
+ 275:                     """, (wl_id, issue_id, author_id, wl_data.get("timeSpentSeconds"), wl_data.get("started"), wl_data.get("created")))
+ 276:             msg = f"Handled Worklog event for {issue_key}"
+ 277: 
+ 278:         else:
+ 279:             if action_name == "DELETED":
+ 280:                 if issue_key:
+ 281:                     cur.execute("DELETE FROM issues WHERE issue_key = %s", (issue_key,))
+ 282:                     msg = f"Deleted {issue_key}"
+ 283:                 else:
+ 284:                     msg = "No key to delete"
+ 285:             else:
+ 286:                 if not issue_id or not issue_key:
+ 287:                     conn.commit()
+ 288:                     return jsonify({"status": "partial_ok", "message": "Logged raw data only"}), 200
+ 289: 
+ 290:                 p_id = upsert_project(cur, project_obj)
+ 291:                 r_id = upsert_user(cur, reporter_obj)
+ 292:                 a_id = upsert_user(cur, assignee_obj)
+ 293: 
+ 294:                 labels = fields.get("labels", [])
+ 295:                 is_client = "client-reported" in [l.lower() for l in labels]
+ 296:                 planned_sp = fields.get("customfield_10016") or story_points
+ 297:                 qa_defects = 1 if "qa-defect" in [l.lower() for l in labels] else 0
+ 298:                 rev_comments = 1 if "review-comment" in [l.lower() for l in labels] else 0
+ 299: 
+ 300:                 cur.execute("""
+ 301:                     INSERT INTO issues (
+ 302:                         id, issue_key, project_id, summary, description, 
+ 303:                         issue_type, status, priority, reporter, assignee, 
+ 304:                         story_points, planned_story_points, is_client_reported,
+ 305:                         qa_defects_count, review_comments_count,
+ 306:                         created, updated, due_date
+ 307:                     )
+ 308:                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ 309:                     ON CONFLICT (id) 
+ 310:                     DO UPDATE SET 
+ 311:                         issue_key    = EXCLUDED.issue_key,
+ 312:                         project_id   = EXCLUDED.project_id,
+ 313:                         summary      = EXCLUDED.summary,
+ 314:                         description  = EXCLUDED.description,
+ 315:                         issue_type   = EXCLUDED.issue_type,
+ 316:                         status       = EXCLUDED.status,
+ 317:                         priority     = EXCLUDED.priority,
+ 318:                         reporter     = EXCLUDED.reporter,
+ 319:                         assignee     = EXCLUDED.assignee,
+ 320:                         story_points = EXCLUDED.story_points,
+ 321:                         planned_story_points = COALESCE(issues.planned_story_points, EXCLUDED.planned_story_points),
+ 322:                         is_client_reported   = EXCLUDED.is_client_reported,
+ 323:                         qa_defects_count     = EXCLUDED.qa_defects_count,
+ 324:                         review_comments_count = EXCLUDED.review_comments_count,
+ 325:                         updated      = EXCLUDED.updated,
+ 326:                         due_date     = EXCLUDED.due_date;
+ 327:                     """,
+ 328:                     (
+ 329:                         issue_id, issue_key, p_id, summary, description,
+ 330:                         issue_type, status, priority, r_id, a_id,
+ 331:                         story_points, planned_sp, is_client,
+ 332:                         qa_defects, rev_comments,
+ 333:                         created_ts, updated_ts, due_date
+ 334:                     )
+ 335:                 )
+ 336: 
+ 337:                 # ── Write status history if this is an update with changelog ──
+ 338:                 changelog = data.get("changelog", {})
+ 339:                 if changelog:
+ 340:                     for item in changelog.get("items", []):
+ 341:                         if item.get("field") == "status":
+ 342:                             changed_by = data.get("user", {}).get("accountId")
+ 343:                             cur.execute("""
+ 344:                                 INSERT INTO issue_status_history (issue_id, from_status, to_status, changed_by, changed_at)
+ 345:                                 VALUES (%s, %s, %s, %s, NOW());
+ 346:                             """, (issue_id, item.get("fromString"), item.get("toString"), changed_by))
+ 347:                             print(f"  📝 Status Change: {item.get('fromString')} → {item.get('toString')}", flush=True)
+ 348: 
+ 349:                 msg = f"Synced {issue_key}"
+ 350:         
+ 351:         conn.commit()
+ 352:         cur.close()
+ 353:         conn.close()
+ 354:         print(f"  ✅ DB Sync Success: {msg}", flush=True)
+ 355:         
+ 356:     except Exception as e:
+ 357:         print(f"  ❌ DB Error: {e}", flush=True)
+ 358:         try: conn.rollback()
+ 359:         except: pass
+ 360:         return jsonify({"error": str(e), "status": "db_error"}), 500
+ 361: 
+ 362:     return jsonify({"status": "ok", "event": event_type, "issue": issue_key}), 200
+ 363: 
+ 364: 
+ 365: # ─────────────────────────────────────────────
+ 366: # Health Check
+ 367: # ─────────────────────────────────────────────
+ 368: @app.route('/health', methods=['GET'])
+ 369: def health():
+ 370:     return jsonify({"status": "ok", "service": "Jira Webhook Listener"}), 200
+ 371: 
+ 372: 
+ 373: # ─────────────────────────────────────────────
+ 374: # Get ALL 12 Metrics for Dashboard
+ 375: # Supports: ?project=BANK,ALGO  ?assignee=acc-01  ?start=&end=  ?days=N
+ 376: # ─────────────────────────────────────────────
+ 377: @app.route('/metrics', methods=['GET'])
+ 378: def get_metrics():
+ 379:     from datetime import date, timedelta
+ 380:     start_str = request.args.get('start')
+ 381:     end_str   = request.args.get('end')
+ 382:     days      = request.args.get('days', 30, type=int)
+ 383: 
+ 384:     if start_str and end_str:
+ 385:         start_date = start_str
+ 386:         end_date   = end_str
+ 387:     else:
+ 388:         end_date   = str(date.today())
+ 389:         start_date = str(date.today() - timedelta(days=days))
+ 390: 
+ 391:     where_sql, filter_args = build_filters()
+ 392: 
+ 393:     try:
+ 394:         conn = get_db_connection()
+ 395:         cur  = conn.cursor()
+ 396: 
+ 397:         date_where = f"DATE(updated) BETWEEN %s AND %s"
+ 398:         date_args  = [start_date, end_date]
+ 399: 
+ 400:         # ── 1. Sprint Velocity (Done SP) ──────────────────────
+ 401:         cur.execute(f"""
+ 402:             SELECT SUM(COALESCE(story_points, 0))
+ 403:             FROM issues
+ 404:             WHERE (status ILIKE '%%done%%' OR status ILIKE '%%resolved%%' OR status ILIKE '%%completed%%')
+ 405:               AND {date_where} {where_sql}
+ 406:         """, date_args + filter_args)
+ 407:         velocity = cur.fetchone()[0] or 0
+ 408: 
+ 409:         # ── 2. Planned vs Delivered (Commit Ratio + Done-to-Said) ──
+ 410:         cur.execute(f"""
+ 411:             SELECT
+ 412:                 SUM(COALESCE(planned_story_points, story_points, 0)) as planned,
+ 413:                 SUM(CASE WHEN status ILIKE '%%done%%' OR status ILIKE '%%resolved%%' OR status ILIKE '%%completed%%'
+ 414:                          THEN COALESCE(story_points, 0) ELSE 0 END) as delivered,
+ 415:                 COUNT(*) FILTER (WHERE status ILIKE '%%done%%' OR status ILIKE '%%resolved%%' OR status ILIKE '%%completed%%') as done_count,
+ 416:                 COUNT(*) as total_count
+ 417:             FROM issues
+ 418:             WHERE {date_where} {where_sql}
+ 419:         """, date_args + filter_args)
+ 420:         res = cur.fetchone()
+ 421:         planned       = res[0] or 1
+ 422:         delivered     = res[1] or 0
+ 423:         done_count    = res[2] or 0
+ 424:         total_count   = res[3] or 0
+ 425:         commit_ratio  = round((delivered / planned * 100), 2)
+ 426:         delivery_commitment = round((done_count / total_count * 100), 2) if total_count > 0 else 0
+ 427: 
+ 428:         # ── 3. Capacity ───────────────────────────────────────────
+ 429:         cur.execute("SELECT SUM(capacity) FROM sprints")
+ 430:         total_capacity = cur.fetchone()[0] or 100
+ 431: 
+ 432:         # ── 4. Productivity ───────────────────────────────────────
+ 433:         productivity = round(delivered / total_capacity, 2)
+ 434: 
+ 435:         # ── 5. Sprint Velocity per Person ─────────────────────────
+ 436:         cur.execute(f"""
+ 437:             SELECT COUNT(DISTINCT assignee) FROM issues
+ 438:             WHERE (status ILIKE '%%done%%' OR status ILIKE '%%resolved%%' OR status ILIKE '%%completed%%')
+ 439:               AND {date_where} {where_sql}
+ 440:         """, date_args + filter_args)
+ 441:         done_assignees = cur.fetchone()[0] or 1
+ 442:         velocity_per_person = round(velocity / done_assignees, 2) if done_assignees > 0 else 0
+ 443: 
+ 444:         # ── 6. Defect Metrics ─────────────────────────────────────
+ 445:         cur.execute(f"""
+ 446:             SELECT 
+ 447:                 COUNT(*) FILTER (WHERE issue_type ILIKE '%%bug%%' OR issue_type ILIKE '%%defect%%') as total_bugs,
+ 448:                 SUM(qa_defects_count) as qa_defects,
+ 449:                 SUM(review_comments_count) as review_comments,
+ 450:                 COUNT(*) FILTER (WHERE is_client_reported = TRUE) as client_defects
+ 451:             FROM issues
+ 452:             WHERE {date_where} {where_sql}
+ 453:         """, date_args + filter_args)
+ 454:         bug_res = cur.fetchone()
+ 455:         total_bugs     = bug_res[0] or 0
+ 456:         qa_defects     = (bug_res[1] or 0) + (bug_res[2] or 0)
+ 457:         client_defects = bug_res[3] or 0
+ 458: 
+ 459:         defect_density_sp = round((qa_defects / planned * 1000), 2) if planned > 0 else 0
+ 460:         
+ 461:         total_valid_defects = qa_defects + client_defects
+ 462:         defect_leakage = round((client_defects / total_valid_defects * 100), 2) if total_valid_defects > 0 else 0
+ 463: 
+ 464:         # ── 7. Resource Utilization ───────────────────────────────
+ 465:         cur.execute(f"""
+ 466:             SELECT SUM(w.time_spent_seconds) FROM worklogs w
+ 467:             JOIN issues i ON w.issue_id = i.id
+ 468:             WHERE DATE(w.started) BETWEEN %s AND %s {where_sql}
+ 469:         """, date_args + filter_args)
+ 470:         actual_effort_seconds = cur.fetchone()[0] or 0
+ 471:         actual_effort_hours = actual_effort_seconds / 3600
+ 472:         capacity_hours = total_capacity * 8
+ 473:         utilization = round((actual_effort_hours / capacity_hours * 100), 2) if capacity_hours > 0 else 0
+ 474: 
+ 475:         # ── 8. Defect Density (Effort-based) ─────────────────────
+ 476:         defect_density_effort = round((qa_defects + client_defects) / actual_effort_hours, 4) if actual_effort_hours > 0 else 0
+ 477: 
+ 478:         # ── 9. Defect Reopen Rate (from status history) ───────────
+ 479:         cur.execute(f"""
+ 480:             SELECT COUNT(*) FROM issue_status_history sh
+ 481:             JOIN issues i ON sh.issue_id = i.id
+ 482:             WHERE (i.issue_type ILIKE '%%bug%%' OR i.issue_type ILIKE '%%defect%%')
+ 483:               AND sh.from_status IN ('Done', 'Resolved', 'Closed')
+ 484:               AND sh.to_status IN ('In Progress', 'Reopened', 'Open', 'To Do')
+ 485:               AND DATE(sh.changed_at) BETWEEN %s AND %s {where_sql.replace('AND project_id', 'AND i.project_id').replace('AND assignee', 'AND i.assignee')}
+ 486:         """, date_args + filter_args)
+ 487:         reopen_count = cur.fetchone()[0] or 0
+ 488:         reopen_rate = round((reopen_count / total_bugs * 100), 2) if total_bugs > 0 else 0
+ 489: 
+ 490:         # ── 10. QA Rejection Rate ─────────────────────────────────
+ 491:         cur.execute(f"""
+ 492:             SELECT COUNT(*) FROM issue_status_history sh
+ 493:             JOIN issues i ON sh.issue_id = i.id
+ 494:             WHERE (i.issue_type ILIKE '%%bug%%' OR i.issue_type ILIKE '%%defect%%')
+ 495:               AND (sh.to_status ILIKE '%%reject%%' OR sh.to_status ILIKE '%%won%%t fix%%' OR sh.to_status ILIKE '%%invalid%%')
+ 496:               AND DATE(sh.changed_at) BETWEEN %s AND %s {where_sql.replace('AND project_id', 'AND i.project_id').replace('AND assignee', 'AND i.assignee')}
+ 497:         """, date_args + filter_args)
+ 498:         rejected_count = cur.fetchone()[0] or 0
+ 499:         qa_rejection_rate = round((rejected_count / total_bugs * 100), 2) if total_bugs > 0 else 0
+ 500: 
+ 501:         # ── 11. Requirements Stability Index (RSI) ────────────────
+ 502:         # RSI = 1 - (added + removed after sprint start / original planned)
+ 503:         # Approximated using issue creation dates vs sprint dates
+ 504:         cur.execute("""
+ 505:             SELECT 
+ 506:                 COUNT(*) FILTER (WHERE DATE(i.created) > s.start_date) as added_after,
+ 507:                 COUNT(*) as total_sprint_issues
+ 508:             FROM issues i
+ 509:             JOIN issue_sprints isp ON i.id = isp.issue_id
+ 510:             JOIN sprints s ON isp.sprint_id = s.id
+ 511:             WHERE s.state = 'ACTIVE'
+ 512:         """)
+ 513:         rsi_res = cur.fetchone()
+ 514:         added_after = rsi_res[0] or 0
+ 515:         total_sprint_issues = rsi_res[1] or 1
+ 516:         rsi = round((1 - (added_after / total_sprint_issues)) * 100, 2)
+ 517: 
+ 518:         # ── 12. Assignees ─────────────────────────────────────────
+ 519:         cur.execute(f"""
+ 520:             SELECT COUNT(DISTINCT assignee) FROM issues
+ 521:             WHERE {date_where} {where_sql}
+ 522:         """, date_args + filter_args)
+ 523:         assignees = cur.fetchone()[0] or 0
+ 524: 
+ 525:         # ── Build Detailed Metrics Array (all 12) ─────────────────
+ 526:         detailed_metrics = [
+ 527:             {"type": "Productivity",       "name": "Productivity",                    "uom": "Ratio",           "formula": "Story points delivered / Available Capacity",           "value": productivity,           "target": "> 0.8",  "trend": "up"},
+ 528:             {"type": "Project Management", "name": "Done to Said Ratio",              "uom": "%",               "formula": "Story points delivered / Story points planned",          "value": f"{commit_ratio}%",    "target": "> 90%",  "trend": "up"},
+ 529:             {"type": "Productivity",       "name": "Sprint Velocity",                 "uom": "Story Points",    "formula": "Total story points delivered",                          "value": int(delivered),         "target": "> 30",   "trend": "up"},
+ 530:             {"type": "Productivity",       "name": "Sprint Velocity per Person",      "uom": "SP / Person",     "formula": "Story points delivered / # of contributors",             "value": velocity_per_person,    "target": "> 5",    "trend": "up"},
+ 531:             {"type": "Quality",            "name": "Defect Density (Story Points)",   "uom": "Defects / SP",    "formula": "(QA defects + review comments) / total story points",    "value": defect_density_sp,     "target": "< 0.5",  "trend": "down"},
+ 532:             {"type": "Quality",            "name": "Defect Leakage to Client",        "uom": "%",               "formula": "(Client defects / Total defects) × 100",                "value": f"{defect_leakage}%",  "target": "< 5%",   "trend": "down"},
+ 533:             {"type": "Project Management", "name": "Resource Utilization",            "uom": "%",               "formula": "(Actual effort hours / Capacity hours) × 100",          "value": f"{utilization}%",     "target": "80-90%", "trend": "up"},
+ 534:             {"type": "Project Management", "name": "Delivery Commitment",             "uom": "%",               "formula": "Delivered stories / Planned stories × 100",             "value": f"{delivery_commitment}%", "target": "> 85%", "trend": "up"},
+ 535:             {"type": "Quality",            "name": "Defect Density (Efforts)",        "uom": "Defects / Hour",  "formula": "(QA + Client defects) / Effort hours",                  "value": defect_density_effort,  "target": "< 0.1",  "trend": "down"},
+ 536:             {"type": "Quality",            "name": "Requirements Stability Index",    "uom": "%",               "formula": "(1 - added after sprint start / total planned) × 100",  "value": f"{rsi}%",             "target": "> 85%",  "trend": "up"},
+ 537:             {"type": "Quality",            "name": "Defect Reopen Rate",              "uom": "%",               "formula": "Reopened defects / QA defects × 100",                   "value": f"{reopen_rate}%",     "target": "< 10%",  "trend": "down"},
+ 538:             {"type": "Quality",            "name": "QA Defect Rejection Rate",        "uom": "%",               "formula": "Rejected defects / QA defects × 100",                   "value": f"{qa_rejection_rate}%","target": "< 15%",  "trend": "down"},
+ 539:         ]
+ 540: 
+ 541:         cur.close()
+ 542:         conn.close()
+ 543: 
+ 544:         return jsonify({
+ 545:             "velocity":           velocity,
+ 546:             "commit_ratio":       f"{commit_ratio}%",
+ 547:             "productivity":       productivity,
+ 548:             "defect_density":     defect_density_sp,
+ 549:             "planned":            planned,
+ 550:             "delivered":          delivered,
+ 551:             "assignees":          assignees,
+ 552:             "bugs":               total_bugs,
+ 553:             "velocity_per_person": velocity_per_person,
+ 554:             "delivery_commitment": f"{delivery_commitment}%",
+ 555:             "defect_leakage":     f"{defect_leakage}%",
+ 556:             "utilization":        f"{utilization}%",
+ 557:             "rsi":                f"{rsi}%",
+ 558:             "reopen_rate":        f"{reopen_rate}%",
+ 559:             "qa_rejection_rate":  f"{qa_rejection_rate}%",
+ 560:             "detailed_metrics":   detailed_metrics,
+ 561:             "start_date":         start_date,
+ 562:             "end_date":           end_date
+ 563:         }), 200
+ 564:     except Exception as e:
+ 565:         return jsonify({"error": str(e)}), 500
+ 566: 
+ 567: 
+ 568: # ─────────────────────────────────────────────
+ 569: # View all stored issues
+ 570: # ─────────────────────────────────────────────
+ 571: @app.route('/issues', methods=['GET'])
+ 572: def get_issues():
+ 573:     where_sql, filter_args = build_filters()
+ 574:     try:
+ 575:         conn = get_db_connection()
+ 576:         cur  = conn.cursor()
+ 577:         cur.execute(f"""
+ 578:             SELECT id, issue_key, summary, status, assignee, created, updated, issue_type, story_points 
+ 579:             FROM issues 
+ 580:             WHERE 1=1 {where_sql}
+ 581:             ORDER BY updated DESC
+ 582:         """, filter_args)
+ 583:         rows = cur.fetchall()
+ 584:         cur.close()
+ 585:         conn.close()
+ 586:         issues = [
+ 587:             {
+ 588:                 "id": r[0], "issue_key": r[1], "summary": r[2], "status": r[3],
+ 589:                 "assignee": r[4], "created": str(r[5]), "updated": str(r[6]),
+ 590:                 "issue_type": r[7], "story_points": r[8]
+ 591:             }
+ 592:             for r in rows
+ 593:         ]
+ 594:         return jsonify(issues), 200
+ 595:     except Exception as e:
+ 596:         return jsonify({"error": str(e)}), 500
+ 597: 
+ 598: 
+ 599: # ─────────────────────────────────────────────
+ 600: # Chart Data Endpoint (daily aggregation)
+ 601: # ─────────────────────────────────────────────
+ 602: @app.route('/metrics/chart', methods=['GET'])
+ 603: def get_chart_data():
+ 604:     from datetime import date, timedelta
+ 605:     start_str = request.args.get('start')
+ 606:     end_str   = request.args.get('end')
+ 607:     days      = request.args.get('days', 30, type=int)
+ 608: 
+ 609:     if start_str and end_str:
+ 610:         start_date = start_str
+ 611:         end_date   = end_str
+ 612:     else:
+ 613:         end_date   = str(date.today())
+ 614:         start_date = str(date.today() - timedelta(days=days))
+ 615: 
+ 616:     where_sql, filter_args = build_filters()
+ 617: 
+ 618:     try:
+ 619:         conn = get_db_connection()
+ 620:         cur  = conn.cursor()
+ 621: 
+ 622:         cur.execute(f"""
+ 623:             SELECT 
+ 624:                 DATE(updated) as day,
+ 625:                 COUNT(*) FILTER (WHERE status ILIKE '%%done%%' OR status ILIKE '%%resolved%%' OR status ILIKE '%%completed%%') as done,
+ 626:                 COUNT(*) FILTER (WHERE status ILIKE '%%progress%%' OR status ILIKE '%%doing%%') as in_progress,
+ 627:                 COUNT(*) FILTER (WHERE status ILIKE '%%to do%%' OR status ILIKE '%%backlog%%' OR status ILIKE '%%open%%') as todo,
+ 628:                 SUM(COALESCE(story_points, 0)) as story_points
+ 629:             FROM issues
+ 630:             WHERE DATE(updated) BETWEEN %s AND %s {where_sql}
+ 631:             GROUP BY DATE(updated)
+ 632:             ORDER BY day ASC
+ 633:         """, [start_date, end_date] + filter_args)
+ 634: 
+ 635:         rows = cur.fetchall()
+ 636:         cur.close()
+ 637:         conn.close()
+ 638: 
+ 639:         data = [
+ 640:             {
+ 641:                 "date": str(r[0]), "done": r[1], "in_progress": r[2],
+ 642:                 "todo": r[3], "story_points": float(r[4]) if r[4] else 0
+ 643:             }
+ 644:             for r in rows
+ 645:         ]
+ 646:         return jsonify(data), 200
+ 647:     except Exception as e:
+ 648:         return jsonify({"error": str(e)}), 500
+ 649: 
+ 650: 
+ 651: if __name__ == "__main__":
+ 652:     print("\n" + "="*55)
+ 653:     print("🚀 JIRA WEBHOOK LISTENER IS NOW LIVE (v3.0 — All 12 Metrics)")
+ 654:     print("="*55)
+ 655:     print(f"📍 Local Endpoint  : http://localhost:5000/jira/webhook")
+ 656:     print(f"📊 Metrics API     : http://localhost:5000/metrics")
+ 657:     print(f"📈 Charts API      : http://localhost:5000/metrics/chart")
+ 658:     print(f"🔍 Issues API      : http://localhost:5000/issues")
+ 659:     print(f"🔑 Config Endpoint : http://localhost:5000/config  (POST to update Jira creds)")
+ 660:     print(f"🌐 Public URL      : (Check your ngrok terminal)")
+ 661:     print("="*55 + "\n")
+ 662: 
+ 663:     # ── Auto-load Jira credentials from CTO DB on startup ──
+ 664:     load_jira_config_from_cto_db()
+ 665: 
+ 666:     app.run(host="0.0.0.0", port=5000, debug=True)
+ 667: 
